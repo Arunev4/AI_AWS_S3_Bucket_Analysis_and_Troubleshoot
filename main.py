@@ -1,39 +1,52 @@
-"""S3 Troubleshooter AI - Main Entry Point."""
+"""
+S3 Troubleshooter AI - Main Entry Point
+========================================
+AI-powered S3 diagnostics, analysis, and auto-remediation.
+"""
 
 import os
 import sys
+import json
 import click
 import yaml
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.prompt import Prompt, Confirm
 from rich.panel import Panel
+from rich.text import Text
 
 from src.aws_client import S3Client
 from src.diagnostics import S3Diagnostics
 from src.ai_engine import AIEngine
 from src.remediator import Remediator
 from src.report_generator import ReportGenerator
+from src.models import BucketReport
 
+# Load environment variables
 load_dotenv()
+
 console = Console()
 
 
-def load_config():
-    path = os.path.join(os.path.dirname(__file__), "config.yaml")
-    if os.path.exists(path):
-        with open(path) as f:
+def load_config() -> dict:
+    """Load configuration from config.yaml."""
+    config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
             return yaml.safe_load(f)
     return {}
 
 
 def print_banner():
-    console.print("")
-    console.print("[bold blue]======================================================[/bold blue]")
-    console.print("[bold blue]          S3 TROUBLESHOOTER AI  v1.0.0                [/bold blue]")
-    console.print("[bold blue]   AI-Powered S3 Diagnostics & Remediation            [/bold blue]")
-    console.print("[bold blue]======================================================[/bold blue]")
-    console.print("")
+    """Print application banner."""
+    banner = """
+╔══════════════════════════════════════════════════════════╗
+║            🪣  S3 TROUBLESHOOTER AI  🤖                  ║
+║       AI-Powered S3 Diagnostics & Remediation            ║
+║                     v1.0.0                               ║
+╚══════════════════════════════════════════════════════════╝
+    """
+    console.print(banner, style="bold blue")
 
 
 @click.group()
@@ -44,6 +57,7 @@ def cli(ctx, region, profile):
     """S3 Troubleshooter AI - Diagnose, analyze, and fix S3 issues."""
     ctx.ensure_object(dict)
     config = load_config()
+
     region = region or config.get("aws", {}).get("default_region", "us-east-1")
     ctx.obj["config"] = config
     ctx.obj["region"] = region
@@ -52,74 +66,113 @@ def cli(ctx, region, profile):
 
 @cli.command()
 @click.argument("bucket_name")
-@click.option("--fix", is_flag=True, help="Auto-fix issues after scan")
+@click.option("--fix", is_flag=True, help="Auto-fix issues after diagnosis")
 @click.option("--auto-approve", is_flag=True, help="Skip fix confirmations")
 @click.option("--no-ai", is_flag=True, help="Skip AI analysis")
-@click.option("--output", type=click.Choice(["console", "json", "html", "all"]), default="all")
+@click.option(
+    "--output", type=click.Choice(["console", "json", "html", "all"]), default="all"
+)
 @click.pass_context
 def diagnose(ctx, bucket_name, fix, auto_approve, no_ai, output):
-    """Run full diagnostic scan on an S3 bucket."""
+    """Run full diagnostic scan on an S3 bucket.
+
+    Example: python main.py diagnose my-bucket-name --fix
+    """
     print_banner()
     config = ctx.obj["config"]
     region = ctx.obj["region"]
     profile = ctx.obj["profile"]
 
+    # Initialize components
+    console.print("[cyan]Initializing...[/cyan]")
+
     s3_client = S3Client(region=region, profile=profile)
 
+    # Verify credentials
     creds = s3_client.verify_credentials()
     if not creds.get("valid"):
-        console.print("[red]AWS credentials invalid: " + str(creds.get("error")) + "[/red]")
-        console.print("[yellow]Run: aws configure[/yellow]")
+        console.print(f"[red]❌ AWS credentials invalid: {creds.get('error')}[/red]")
+        console.print("[yellow]Please configure AWS credentials:[/yellow]")
+        console.print("  aws configure")
+        console.print("  or set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in .env")
         sys.exit(1)
 
-    console.print("[green]AWS Account: " + creds["account"] + "[/green]")
-    console.print("[green]Identity: " + creds["arn"] + "[/green]")
-    console.print("")
-    console.print("[bold cyan]Scanning bucket: " + bucket_name + "[/bold cyan]")
-    console.print("")
+    console.print(f"[green]✓ AWS Account: {creds['account']}[/green]")
+    console.print(f"[green]✓ Identity: {creds['arn']}[/green]")
+
+    # Run diagnostics
+    console.print(f"\n[bold cyan]🔍 Scanning bucket: {bucket_name}[/bold cyan]\n")
 
     diagnostics = S3Diagnostics(s3_client)
     report = diagnostics.run_all_checks(bucket_name)
 
+    # AI Analysis
     if not no_ai:
-        model = config.get("ai", {}).get("model", "gpt-4")
-        ai = AIEngine(model=model, region=ctx.obj["region"], profile=ctx.obj["profile"])
-        if ai.is_available():
-            console.print("[cyan]Running AI analysis...[/cyan]")
-            ai_result = ai.analyze_report(report)
+        ai_model = config.get("ai", {}).get("model", "gpt-4")
+        ai_engine = AIEngine(model=ai_model)
+
+        if ai_engine.is_available():
+            console.print("\n[cyan]🤖 Running AI analysis...[/cyan]")
+            ai_result = ai_engine.analyze_report(report)
+
             if isinstance(ai_result, dict):
                 report.ai_analysis = ai_result.get("analysis", "")
                 report.ai_summary = ai_result.get("summary", "")
-                actions = ai_result.get("priority_actions", [])
-                if actions:
-                    console.print("[bold yellow]AI Priority Actions:[/bold yellow]")
-                    for a in actions:
-                        if isinstance(a, dict):
-                            console.print("  [" + str(a.get("priority", "?")) + "] " + str(a.get("action", "N/A")))
-        else:
-            console.print("[yellow]AI skipped (no OPENAI_API_KEY)[/yellow]")
 
-    rg = ReportGenerator(output_dir=config.get("reporting", {}).get("output_dir", "reports"))
-    if output in ("console", "all"):
-        rg.print_console_report(report)
-    if output in ("json", "all"):
-        rg.save_json_report(report)
-    if output in ("html", "all"):
-        rg.save_html_report(report)
-
-    if fix:
-        console.print("[bold yellow]Auto-Remediation...[/bold yellow]")
-        rem = Remediator(s3_client, auto_approve=auto_approve)
-        results = rem.remediate_all(report)
-        for fr in results:
-            if fr.get("success"):
-                console.print("[green]  OK: " + fr["check"] + " - " + fr.get("message", "") + "[/green]")
+                # Print priority actions
+                priority_actions = ai_result.get("priority_actions", [])
+                if priority_actions:
+                    console.print(
+                        "\n[bold yellow]🎯 AI Priority Actions:[/bold yellow]"
+                    )
+                    for action in priority_actions:
+                        if isinstance(action, dict):
+                            console.print(
+                                f"  [{action.get('priority', '?')}] {action.get('action', 'N/A')}"
+                            )
+                            if action.get("commands"):
+                                for cmd in action["commands"]:
+                                    console.print(f"      $ {cmd}", style="dim")
             else:
-                console.print("[red]  FAIL: " + fr["check"] + " - " + fr.get("error", "Unknown") + "[/red]")
+                report.ai_analysis = str(ai_result)
+        else:
+            console.print("[yellow]⚠ AI analysis skipped (no API key)[/yellow]")
 
-    console.print("")
-    console.print("[bold]Score: " + str(report.score) + "/100 - " + report.overall_health + "[/bold]")
-    console.print("")
+    # Generate reports
+    report_gen = ReportGenerator(
+        output_dir=config.get("reporting", {}).get("output_dir", "reports")
+    )
+
+    if output in ("console", "all"):
+        report_gen.print_console_report(report)
+
+    if output in ("json", "all"):
+        report_gen.save_json_report(report)
+
+    if output in ("html", "all"):
+        report_gen.save_html_report(report)
+
+    # Auto-remediation
+    if fix:
+        console.print("\n[bold yellow]🔧 Starting Auto-Remediation...[/bold yellow]")
+        remediator = Remediator(s3_client, auto_approve=auto_approve)
+        fix_results = remediator.remediate_all(report)
+
+        if fix_results:
+            console.print("\n[bold]Remediation Summary:[/bold]")
+            for fr in fix_results:
+                status = "✓" if fr.get("success") else "✗"
+                color = "green" if fr.get("success") else "red"
+                console.print(
+                    f"  [{color}]{status} {fr['check']}: {fr.get('message', fr.get('error', 'Unknown'))}[/{color}]"
+                )
+
+    # Final summary
+    console.print(f"\n[bold]{'=' * 60}[/bold]")
+    console.print(
+        f"[bold]Final Score: {report.score}/100 — {report.overall_health}[/bold]"
+    )
+    console.print(f"[bold]{'=' * 60}[/bold]\n")
 
 
 @cli.command()
@@ -127,145 +180,256 @@ def diagnose(ctx, bucket_name, fix, auto_approve, no_ai, output):
 def list_buckets(ctx):
     """List all S3 buckets in the account."""
     print_banner()
-    s3 = S3Client(region=ctx.obj["region"], profile=ctx.obj["profile"])
-    creds = s3.verify_credentials()
+    region = ctx.obj["region"]
+    profile = ctx.obj["profile"]
+
+    s3_client = S3Client(region=region, profile=profile)
+
+    creds = s3_client.verify_credentials()
     if not creds.get("valid"):
-        console.print("[red]Credentials invalid: " + str(creds.get("error")) + "[/red]")
+        console.print(f"[red]❌ Credentials invalid: {creds.get('error')}[/red]")
         sys.exit(1)
-    console.print("[green]AWS Account: " + creds["account"] + "[/green]")
-    buckets = s3.list_buckets()
+
+    buckets = s3_client.list_buckets()
+
     if not buckets:
         console.print("[yellow]No buckets found.[/yellow]")
         return
-    console.print("[bold cyan]Found " + str(len(buckets)) + " bucket(s):[/bold cyan]")
-    for i, b in enumerate(buckets, 1):
-        console.print("  " + str(i) + ". " + b)
-    console.print("")
-    console.print("[dim]Run: python main.py diagnose <bucket-name>[/dim]")
+
+    console.print(f"\n[bold cyan]Found {len(buckets)} bucket(s):[/bold cyan]")
+    for i, bucket in enumerate(buckets, 1):
+        console.print(f"  {i}. {bucket}")
+
+    console.print(
+        f"\n[dim]Use 'python main.py diagnose <bucket-name>' to scan a bucket.[/dim]"
+    )
 
 
 @cli.command()
 @click.argument("bucket_name")
 @click.pass_context
 def troubleshoot(ctx, bucket_name):
-    """Interactive AI troubleshooting session."""
+    """Interactive AI troubleshooting session for a bucket.
+
+    Example: python main.py troubleshoot my-bucket-name
+    """
     print_banner()
     config = ctx.obj["config"]
-    s3 = S3Client(region=ctx.obj["region"], profile=ctx.obj["profile"])
-    ai = AIEngine(model=config.get("ai", {}).get("model", "gpt-4"), region=ctx.obj["region"], profile=ctx.obj["profile"])
+    region = ctx.obj["region"]
+    profile = ctx.obj["profile"]
 
-    if not ai.is_available():
-        console.print("[red]Set OPENAI_API_KEY in .env[/red]")
+    s3_client = S3Client(region=region, profile=profile)
+    ai_model = config.get("ai", {}).get("model", "gpt-4")
+    ai_engine = AIEngine(model=ai_model)
+
+    if not ai_engine.is_available():
+        console.print("[red]❌ AI engine unavailable. Set OPENAI_API_KEY in .env[/red]")
         sys.exit(1)
 
-    creds = s3.verify_credentials()
+    creds = s3_client.verify_credentials()
     if not creds.get("valid"):
-        console.print("[red]Credentials invalid[/red]")
+        console.print(f"[red]❌ Credentials invalid: {creds.get('error')}[/red]")
         sys.exit(1)
 
-    console.print("[cyan]Troubleshooting: " + bucket_name + "[/cyan]")
-    console.print("[dim]Type quit to exit, scan for diagnostics[/dim]")
-    console.print("")
+    console.print(f"[cyan]🤖 Interactive Troubleshooting for: {bucket_name}[/cyan]")
+    console.print("[dim]Type 'quit' or 'exit' to end the session.[/dim]")
+    console.print("[dim]Type 'scan' to run a full diagnostic first.[/dim]")
+    console.print("[dim]Type 'policy <use-case>' to generate a bucket policy.[/dim]\n")
 
-    diag = S3Diagnostics(s3)
+    # Gather initial context
+    diagnostics = S3Diagnostics(s3_client)
     context = {}
 
     while True:
         try:
-            q = Prompt.ask("[bold green]Describe your issue[/bold green]")
-            if q.lower() in ("quit", "exit", "q"):
-                console.print("[cyan]Goodbye![/cyan]")
+            user_input = Prompt.ask("\n[bold green]Describe your issue[/bold green]")
+
+            if user_input.lower() in ("quit", "exit", "q"):
+                console.print("[cyan]Session ended. Goodbye![/cyan]")
                 break
-            if q.lower() == "scan":
-                report = diag.run_all_checks(bucket_name)
-                ReportGenerator().print_console_report(report)
-                context["scan"] = report.to_dict()
+
+            if user_input.lower() == "scan":
+                console.print("[cyan]Running full diagnostic scan...[/cyan]")
+                report = diagnostics.run_all_checks(bucket_name)
+                report_gen = ReportGenerator()
+                report_gen.print_console_report(report)
+                context["last_scan"] = report.to_dict()
                 continue
-            console.print("[cyan]Thinking...[/cyan]")
-            resp = ai.troubleshoot_issue(q, bucket_name, context)
-            console.print(Panel(resp, title="AI Response", border_style="blue"))
+
+            if user_input.lower().startswith("policy "):
+                use_case = user_input[7:].strip()
+                console.print(
+                    f"[cyan]Generating policy for use case: {use_case}...[/cyan]"
+                )
+                policy = ai_engine.generate_policy_recommendation(bucket_name, use_case)
+                console.print(
+                    Panel(policy, title="Generated Bucket Policy", border_style="green")
+                )
+                continue
+
+            # Regular troubleshooting
+            console.print("[cyan]🤖 Analyzing...[/cyan]")
+            response = ai_engine.troubleshoot_issue(
+                issue_description=user_input,
+                bucket_name=bucket_name,
+                context=context,
+            )
+            console.print(
+                Panel(
+                    response,
+                    title="🤖 AI Response",
+                    border_style="blue",
+                    padding=(1, 2),
+                )
+            )
+
         except KeyboardInterrupt:
-            console.print("[cyan]Bye![/cyan]")
+            console.print("\n[cyan]Session ended.[/cyan]")
             break
 
 
 @cli.command()
 @click.argument("bucket_name")
-@click.option("--auto-approve", is_flag=True)
+@click.option("--auto-approve", is_flag=True, help="Skip confirmations")
 @click.pass_context
 def fix(ctx, bucket_name, auto_approve):
-    """Scan and auto-fix a bucket."""
+    """Scan and auto-fix issues on a bucket.
+
+    Example: python main.py fix my-bucket-name --auto-approve
+    """
     print_banner()
-    s3 = S3Client(region=ctx.obj["region"], profile=ctx.obj["profile"])
-    creds = s3.verify_credentials()
+    region = ctx.obj["region"]
+    profile = ctx.obj["profile"]
+
+    s3_client = S3Client(region=region, profile=profile)
+
+    creds = s3_client.verify_credentials()
     if not creds.get("valid"):
-        console.print("[red]Credentials invalid[/red]")
+        console.print(f"[red]❌ Credentials invalid[/red]")
         sys.exit(1)
 
-    console.print("[cyan]Scanning " + bucket_name + "...[/cyan]")
-    diag = S3Diagnostics(s3)
-    report = diag.run_all_checks(bucket_name)
-    ReportGenerator().print_console_report(report)
+    # Scan
+    console.print(f"[cyan]🔍 Scanning {bucket_name}...[/cyan]\n")
+    diagnostics = S3Diagnostics(s3_client)
+    report = diagnostics.run_all_checks(bucket_name)
 
-    console.print("[bold yellow]Auto-Remediation[/bold yellow]")
-    rem = Remediator(s3, auto_approve=auto_approve)
-    results = rem.remediate_all(report)
+    # Show quick summary
+    report_gen = ReportGenerator()
+    report_gen.print_console_report(report)
 
-    if results:
-        console.print("[cyan]Re-scanning...[/cyan]")
-        new_report = diag.run_all_checks(bucket_name)
-        diff = new_report.score - report.score
-        console.print("[bold]Before: " + str(report.score) + " -> After: " + str(new_report.score) + "[/bold]")
-        if diff > 0:
-            console.print("[green]Improved by " + str(diff) + " points![/green]")
+    # Fix
+    console.print("\n[bold yellow]🔧 Auto-Remediation[/bold yellow]")
+    remediator = Remediator(s3_client, auto_approve=auto_approve)
+    fix_results = remediator.remediate_all(report)
+
+    if fix_results:
+        # Re-scan to verify
+        console.print("\n[cyan]🔍 Re-scanning to verify fixes...[/cyan]\n")
+        new_report = diagnostics.run_all_checks(bucket_name)
+        new_report.calculate_score()
+
+        console.print(
+            f"[bold]Before: {report.score}/100 → After: {new_report.score}/100[/bold]"
+        )
+
+        improvement = new_report.score - report.score
+        if improvement > 0:
+            console.print(f"[green]📈 Improved by {improvement} points![/green]")
+        else:
+            console.print(
+                "[yellow]Score unchanged. Some issues may require manual intervention.[/yellow]"
+            )
 
 
 @cli.command()
 @click.pass_context
 def scan_all(ctx):
-    """Scan ALL buckets in the account."""
+    """Scan ALL buckets in the account and generate a summary."""
     print_banner()
-    s3 = S3Client(region=ctx.obj["region"], profile=ctx.obj["profile"])
-    creds = s3.verify_credentials()
+    region = ctx.obj["region"]
+    profile = ctx.obj["profile"]
+
+    s3_client = S3Client(region=region, profile=profile)
+
+    creds = s3_client.verify_credentials()
     if not creds.get("valid"):
-        console.print("[red]Credentials invalid[/red]")
+        console.print(f"[red]❌ Credentials invalid[/red]")
         sys.exit(1)
 
-    buckets = s3.list_buckets()
+    buckets = s3_client.list_buckets()
     if not buckets:
         console.print("[yellow]No buckets found.[/yellow]")
         return
 
-    console.print("[cyan]Scanning " + str(len(buckets)) + " buckets...[/cyan]")
-    diag = S3Diagnostics(s3)
-    rg = ReportGenerator()
-    reports = []
+    console.print(f"[cyan]Found {len(buckets)} buckets. Starting scan...[/cyan]\n")
 
-    for b in buckets:
-        console.print("[bold cyan]--- " + b + " ---[/bold cyan]")
+    diagnostics = S3Diagnostics(s3_client)
+    report_gen = ReportGenerator()
+    all_reports = []
+
+    for bucket in buckets:
+        console.print(f"\n[bold cyan]{'=' * 40}[/bold cyan]")
+        console.print(f"[bold cyan]Scanning: {bucket}[/bold cyan]")
+        console.print(f"[bold cyan]{'=' * 40}[/bold cyan]")
+
         try:
-            r = diag.run_all_checks(b)
-            reports.append(r)
-            rg.save_json_report(r)
-            console.print("  Score: " + str(r.score) + "/100 - " + r.overall_health)
+            report = diagnostics.run_all_checks(bucket)
+            all_reports.append(report)
+            report_gen.save_json_report(report)
+            console.print(f"  Score: {report.score}/100 — {report.overall_health}")
         except Exception as e:
-            console.print("[red]  Error: " + str(e) + "[/red]")
+            console.print(f"  [red]Error scanning {bucket}: {e}[/red]")
 
-    if reports:
+    # Print summary table
+    if all_reports:
         from rich.table import Table
-        console.print("")
-        console.print("[bold cyan]ACCOUNT SUMMARY[/bold cyan]")
-        t = Table(show_lines=True)
-        t.add_column("Bucket", style="cyan")
-        t.add_column("Score", justify="center")
-        t.add_column("Health", justify="center")
-        for r in sorted(reports, key=lambda x: x.score):
-            c = "green" if r.score >= 70 else ("yellow" if r.score >= 40 else "red")
-            t.add_row(r.bucket_name, "[" + c + "]" + str(r.score) + "[/" + c + "]", "[" + c + "]" + r.overall_health + "[/" + c + "]")
-        console.print(t)
-        avg = sum(r.score for r in reports) / len(reports)
-        console.print("[bold]Average: " + str(int(avg)) + "/100 | Buckets: " + str(len(reports)) + "[/bold]")
+
+        console.print(f"\n\n[bold cyan]{'=' * 60}[/bold cyan]")
+        console.print(f"[bold cyan]  ACCOUNT-WIDE S3 HEALTH SUMMARY[/bold cyan]")
+        console.print(f"[bold cyan]{'=' * 60}[/bold cyan]\n")
+
+        table = Table(show_lines=True)
+        table.add_column("Bucket", style="cyan")
+        table.add_column("Score", justify="center")
+        table.add_column("Health", justify="center")
+        table.add_column("Pass", justify="center", style="green")
+        table.add_column("Fail", justify="center", style="red")
+        table.add_column("Warn", justify="center", style="yellow")
+
+        for r in sorted(all_reports, key=lambda x: x.score):
+            health_colors = {
+                "HEALTHY": "green",
+                "GOOD": "green",
+                "NEEDS_ATTENTION": "yellow",
+                "UNHEALTHY": "red",
+                "CRITICAL": "bold red",
+            }
+            hc = health_colors.get(r.overall_health, "white")
+
+            from src.models import CheckStatus
+
+            passed = sum(1 for res in r.results if res.status == CheckStatus.PASS)
+            failed = sum(1 for res in r.results if res.status == CheckStatus.FAIL)
+            warned = sum(1 for res in r.results if res.status == CheckStatus.WARNING)
+
+            table.add_row(
+                r.bucket_name,
+                f"[{hc}]{r.score}/100[/{hc}]",
+                f"[{hc}]{r.overall_health}[/{hc}]",
+                str(passed),
+                str(failed),
+                str(warned),
+            )
+
+        console.print(table)
+
+        avg_score = sum(r.score for r in all_reports) / len(all_reports)
+        console.print(f"\n[bold]Average Account Score: {avg_score:.0f}/100[/bold]")
+        console.print(f"[bold]Total Buckets Scanned: {len(all_reports)}[/bold]\n")
 
 
+# ─────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────
 if __name__ == "__main__":
     cli()

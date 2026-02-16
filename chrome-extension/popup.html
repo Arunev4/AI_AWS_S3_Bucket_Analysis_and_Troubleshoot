@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>S3 Troubleshooter AI</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <!-- HEADER -->
+    <div class="header">
+      <div class="logo">&#x1F5C3; S3 Troubleshooter AI</div>
+      <div class="status" id="status">
+        <span class="dot" id="statusDot"></span>
+        <span id="statusText">Connecting...</span>
+      </div>
+    </div>
+
+    <!-- TABS -->
+    <div class="tabs">
+      <button class="tab active" data-tab="dashboard">Dashboard</button>
+      <button class="tab" data-tab="diagnose">Diagnose</button>
+      <button class="tab" data-tab="troubleshoot">AI Chat</button>
+      <button class="tab" data-tab="scanall">Scan All</button>
+    </div>
+
+    <!-- DASHBOARD TAB -->
+    <div class="tab-content active" id="tab-dashboard">
+      <div class="card">
+        <h3>AWS Account</h3>
+        <div id="accountInfo">Loading...</div>
+      </div>
+      <div class="card">
+        <h3>Buckets</h3>
+        <div id="bucketCount">Loading...</div>
+        <div class="bucket-list" id="bucketList"></div>
+      </div>
+    </div>
+
+    <!-- DIAGNOSE TAB -->
+    <div class="tab-content" id="tab-diagnose">
+      <div class="card">
+        <h3>Diagnose Bucket</h3>
+        <div class="input-group">
+          <select id="bucketSelect">
+            <option value="">Select a bucket...</option>
+          </select>
+          <div class="btn-row">
+            <button class="btn btn-primary" id="btnDiagnose">Scan</button>
+            <button class="btn btn-ai" id="btnDiagnoseAI">Scan + AI</button>
+            <button class="btn btn-fix" id="btnFix">Auto-Fix</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="diagnoseResults" class="hidden">
+        <div class="card score-card">
+          <div class="score-circle" id="scoreCircle">
+            <span class="score-number" id="scoreNumber">0</span>
+            <span class="score-label">/100</span>
+          </div>
+          <div class="score-health" id="scoreHealth">UNKNOWN</div>
+        </div>
+
+        <div class="card">
+          <h3>Check Results</h3>
+          <div id="checkResults"></div>
+        </div>
+
+        <div class="card hidden" id="aiAnalysisCard">
+          <h3>&#x1F916; AI Analysis</h3>
+          <div id="aiAnalysis"></div>
+        </div>
+
+        <div class="card hidden" id="fixResultsCard">
+          <h3>&#x1F527; Fix Results</h3>
+          <div id="fixResults"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- TROUBLESHOOT TAB -->
+    <div class="tab-content" id="tab-troubleshoot">
+      <div class="card">
+        <h3>&#x1F916; AI Troubleshooter</h3>
+        <div class="input-group">
+          <select id="chatBucketSelect">
+            <option value="">Select a bucket...</option>
+          </select>
+        </div>
+        <div class="chat-box" id="chatBox">
+          <div class="chat-message bot">Hi! Describe your S3 issue and I will help troubleshoot it.</div>
+        </div>
+        <div class="chat-input">
+          <input type="text" id="chatInput" placeholder="e.g., I am getting Access Denied..." />
+          <button class="btn btn-primary" id="btnChat">Send</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- SCAN ALL TAB -->
+    <div class="tab-content" id="tab-scanall">
+      <div class="card">
+        <h3>Account-Wide Scan</h3>
+        <button class="btn btn-primary" id="btnScanAll">Scan All Buckets</button>
+        <div id="scanAllProgress" class="hidden">
+          <div class="progress-bar"><div class="progress-fill" id="scanProgress"></div></div>
+          <div id="scanStatus">Scanning...</div>
+        </div>
+      </div>
+      <div id="scanAllResults" class="hidden">
+        <div class="card">
+          <div class="summary-stats" id="summaryStats"></div>
+        </div>
+        <div class="card">
+          <h3>All Buckets</h3>
+          <div id="allBucketsTable"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- LOADING OVERLAY -->
+    <div class="loading hidden" id="loading">
+      <div class="spinner"></div>
+      <div id="loadingText">Scanning...</div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,9 +1,10 @@
-"""S3 diagnostic checks."""
+"""Comprehensive S3 diagnostic checks."""
 
 import json
-from datetime import datetime
+from typing import Optional
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn
+
 from src.aws_client import S3Client
 from src.models import DiagnosticResult, BucketReport, Severity, CheckStatus
 
@@ -11,12 +12,16 @@ console = Console()
 
 
 class S3Diagnostics:
-    def __init__(self, s3_client):
+    """Runs all diagnostic checks against an S3 bucket."""
+
+    def __init__(self, s3_client: S3Client):
         self.s3 = s3_client
 
-    def run_all_checks(self, bucket_name):
+    def run_all_checks(self, bucket_name: str) -> BucketReport:
+        """Run all diagnostic checks and return a complete report."""
         region = self.s3.get_bucket_location(bucket_name) or self.s3.region
         report = BucketReport(bucket_name=bucket_name, region=region)
+
         checks = [
             ("Bucket Existence & Access", self.check_bucket_exists),
             ("Bucket Policy", self.check_bucket_policy),
@@ -33,136 +38,557 @@ class S3Diagnostics:
             ("Bucket Tagging", self.check_tagging),
             ("Bucket Size", self.check_bucket_size),
         ]
-        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), console=console) as progress:
-            task = progress.add_task("Running...", total=len(checks))
-            for name, func in checks:
-                progress.update(task, description="Checking: " + name)
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console,
+        ) as progress:
+            task = progress.add_task("Running diagnostics...", total=len(checks))
+
+            for check_name, check_func in checks:
+                progress.update(task, description=f"Checking: {check_name}...")
                 try:
-                    report.add_result(func(bucket_name))
+                    result = check_func(bucket_name)
+                    report.add_result(result)
                 except Exception as e:
-                    report.add_result(DiagnosticResult(name, CheckStatus.ERROR, Severity.MEDIUM, str(e)))
+                    report.add_result(
+                        DiagnosticResult(
+                            check_name=check_name,
+                            status=CheckStatus.ERROR,
+                            severity=Severity.MEDIUM,
+                            message=f"Check failed with error: {str(e)}",
+                            details={"exception": str(e)},
+                        )
+                    )
                 progress.advance(task)
+
+        from datetime import datetime
+
         report.scan_end = datetime.utcnow().isoformat()
         report.calculate_score()
         return report
 
-    def check_bucket_exists(self, bucket_name):
-        r = self.s3.bucket_exists(bucket_name)
-        if r.get("exists") and r.get("accessible"):
-            return DiagnosticResult("Bucket Existence & Access", CheckStatus.PASS, Severity.CRITICAL, "Bucket '" + bucket_name + "' exists and is accessible.", r)
-        elif r.get("exists"):
-            return DiagnosticResult("Bucket Existence & Access", CheckStatus.FAIL, Severity.CRITICAL, "Bucket '" + bucket_name + "' exists but ACCESS DENIED.", r, "Check IAM policies.")
-        return DiagnosticResult("Bucket Existence & Access", CheckStatus.FAIL, Severity.CRITICAL, "Bucket '" + bucket_name + "' does NOT exist.", r, "Verify bucket name.")
+    # ------------------------------------------------------------------ #
+    #                     INDIVIDUAL CHECK METHODS                        #
+    # ------------------------------------------------------------------ #
 
-    def check_bucket_policy(self, bucket_name):
-        r = self.s3.get_bucket_policy(bucket_name)
-        if not r.get("exists"):
-            return DiagnosticResult("Bucket Policy", CheckStatus.WARNING, Severity.LOW, "No bucket policy.", r, "Consider adding one.")
+    def check_bucket_exists(self, bucket_name: str) -> DiagnosticResult:
+        """Check if the bucket exists and is accessible."""
+        result = self.s3.bucket_exists(bucket_name)
+
+        if result.get("exists") and result.get("accessible"):
+            return DiagnosticResult(
+                check_name="Bucket Existence & Access",
+                status=CheckStatus.PASS,
+                severity=Severity.CRITICAL,
+                message=f"Bucket '{bucket_name}' exists and is accessible.",
+                details=result,
+            )
+        elif result.get("exists") and not result.get("accessible"):
+            return DiagnosticResult(
+                check_name="Bucket Existence & Access",
+                status=CheckStatus.FAIL,
+                severity=Severity.CRITICAL,
+                message=f"Bucket '{bucket_name}' exists but ACCESS DENIED.",
+                details=result,
+                recommendation="Check IAM policies. Ensure your user/role has s3:ListBucket, "
+                "s3:GetBucketLocation permissions. Check bucket policy for explicit denies.",
+            )
+        else:
+            return DiagnosticResult(
+                check_name="Bucket Existence & Access",
+                status=CheckStatus.FAIL,
+                severity=Severity.CRITICAL,
+                message=f"Bucket '{bucket_name}' does NOT exist.",
+                details=result,
+                recommendation="Verify the bucket name (case-sensitive, globally unique). "
+                "Check for typos. The bucket may have been deleted.",
+            )
+
+    def check_bucket_policy(self, bucket_name: str) -> DiagnosticResult:
+        """Analyze bucket policy for security issues."""
+        result = self.s3.get_bucket_policy(bucket_name)
+
+        if not result.get("exists"):
+            return DiagnosticResult(
+                check_name="Bucket Policy",
+                status=CheckStatus.WARNING,
+                severity=Severity.LOW,
+                message="No bucket policy is configured.",
+                details=result,
+                recommendation="Consider adding a bucket policy to explicitly define access controls.",
+            )
+
+        # Parse and analyze the policy
         try:
-            policy = json.loads(r["policy"])
+            policy = json.loads(result["policy"])
             issues = []
-            for st in policy.get("Statement", []):
-                p = st.get("Principal", "")
-                e = st.get("Effect", "")
-                a = st.get("Action", "")
-                if e == "Allow" and (p == "*" or p == {"AWS": "*"}):
-                    issues.append({"type": "OPEN_ACCESS", "severity": "CRITICAL"})
-                if isinstance(a, str) and a == "s3:*":
-                    issues.append({"type": "WILDCARD", "severity": "HIGH"})
+            details = {"policy": policy, "issues": issues}
+
+            for statement in policy.get("Statement", []):
+                principal = statement.get("Principal", "")
+                effect = statement.get("Effect", "")
+                action = statement.get("Action", "")
+
+                # Check for wildcard principal with Allow
+                if effect == "Allow" and (
+                    principal == "*" or principal == {"AWS": "*"}
+                ):
+                    issues.append(
+                        {
+                            "type": "OPEN_ACCESS",
+                            "severity": "CRITICAL",
+                            "detail": f"Statement allows access to everyone (*). Actions: {action}",
+                        }
+                    )
+
+                # Check for overly permissive actions
+                if isinstance(action, str) and action == "s3:*":
+                    issues.append(
+                        {
+                            "type": "WILDCARD_ACTIONS",
+                            "severity": "HIGH",
+                            "detail": "Statement uses wildcard action s3:* — overly permissive.",
+                        }
+                    )
+
+                # Check for missing conditions on sensitive actions
+                sensitive_actions = [
+                    "s3:DeleteBucket",
+                    "s3:DeleteObject",
+                    "s3:PutBucketPolicy",
+                ]
+                if isinstance(action, list):
+                    for a in action:
+                        if a in sensitive_actions and "Condition" not in statement:
+                            issues.append(
+                                {
+                                    "type": "MISSING_CONDITION",
+                                    "severity": "MEDIUM",
+                                    "detail": f"Sensitive action '{a}' has no Condition block.",
+                                }
+                            )
+
             if issues:
-                crit = any(i["severity"] == "CRITICAL" for i in issues)
-                return DiagnosticResult("Bucket Policy", CheckStatus.FAIL if crit else CheckStatus.WARNING, Severity.CRITICAL if crit else Severity.HIGH, str(len(issues)) + " issue(s).", {"policy": policy, "issues": issues}, "Tighten policy.")
-            return DiagnosticResult("Bucket Policy", CheckStatus.PASS, Severity.HIGH, "Policy looks good.", {"policy": policy})
+                critical = any(i["severity"] == "CRITICAL" for i in issues)
+                return DiagnosticResult(
+                    check_name="Bucket Policy",
+                    status=CheckStatus.FAIL if critical else CheckStatus.WARNING,
+                    severity=Severity.CRITICAL if critical else Severity.HIGH,
+                    message=f"Bucket policy has {len(issues)} issue(s).",
+                    details=details,
+                    recommendation="Review and tighten bucket policy. Remove wildcard principals, "
+                    "restrict actions, and add conditions.",
+                )
+
+            return DiagnosticResult(
+                check_name="Bucket Policy",
+                status=CheckStatus.PASS,
+                severity=Severity.HIGH,
+                message="Bucket policy exists and appears properly configured.",
+                details=details,
+            )
+
         except json.JSONDecodeError:
-            return DiagnosticResult("Bucket Policy", CheckStatus.ERROR, Severity.HIGH, "Parse error.", r)
+            return DiagnosticResult(
+                check_name="Bucket Policy",
+                status=CheckStatus.ERROR,
+                severity=Severity.HIGH,
+                message="Failed to parse bucket policy JSON.",
+                details=result,
+            )
 
-    def check_public_access(self, bucket_name):
-        r = self.s3.get_public_access_block(bucket_name)
-        if not r.get("exists"):
-            return DiagnosticResult("Public Access Block", CheckStatus.FAIL, Severity.CRITICAL, "No Public Access Block!", r, "Enable all settings.", True, "Enable all Public Access Block settings.")
-        c = r["config"]
-        if all([c.get("BlockPublicAcls", False), c.get("IgnorePublicAcls", False), c.get("BlockPublicPolicy", False), c.get("RestrictPublicBuckets", False)]):
-            return DiagnosticResult("Public Access Block", CheckStatus.PASS, Severity.CRITICAL, "All blocked.", {"config": c})
-        d = [k for k, v in c.items() if not v]
-        return DiagnosticResult("Public Access Block", CheckStatus.FAIL, Severity.CRITICAL, "Incomplete: " + str(d), {"config": c}, "Enable: " + str(d), True, "Fix public access.")
+    def check_public_access(self, bucket_name: str) -> DiagnosticResult:
+        """Check Public Access Block configuration."""
+        result = self.s3.get_public_access_block(bucket_name)
 
-    def check_acl_permissions(self, bucket_name):
-        r = self.s3.get_bucket_acl(bucket_name)
-        if not r.get("success"):
-            return DiagnosticResult("ACL Permissions", CheckStatus.ERROR, Severity.HIGH, "Cannot get ACL.", r)
+        if not result.get("exists"):
+            return DiagnosticResult(
+                check_name="Public Access Block",
+                status=CheckStatus.FAIL,
+                severity=Severity.CRITICAL,
+                message="No Public Access Block configuration found! Bucket may be publicly accessible.",
+                details=result,
+                recommendation="Enable all four Public Access Block settings immediately.",
+                auto_fixable=True,
+                fix_description="Enable BlockPublicAcls, IgnorePublicAcls, BlockPublicPolicy, RestrictPublicBuckets.",
+            )
+
+        config = result["config"]
+        all_blocked = all(
+            [
+                config.get("BlockPublicAcls", False),
+                config.get("IgnorePublicAcls", False),
+                config.get("BlockPublicPolicy", False),
+                config.get("RestrictPublicBuckets", False),
+            ]
+        )
+
+        if all_blocked:
+            return DiagnosticResult(
+                check_name="Public Access Block",
+                status=CheckStatus.PASS,
+                severity=Severity.CRITICAL,
+                message="All public access is blocked.",
+                details={"config": config},
+            )
+
+        disabled_settings = [k for k, v in config.items() if not v]
+        return DiagnosticResult(
+            check_name="Public Access Block",
+            status=CheckStatus.FAIL,
+            severity=Severity.CRITICAL,
+            message=f"Public access block is INCOMPLETE. Disabled: {disabled_settings}",
+            details={"config": config, "disabled": disabled_settings},
+            recommendation=f"Enable these settings: {disabled_settings}",
+            auto_fixable=True,
+            fix_description="Set all Public Access Block settings to True.",
+        )
+
+    def check_acl_permissions(self, bucket_name: str) -> DiagnosticResult:
+        """Check ACL for overly permissive grants."""
+        result = self.s3.get_bucket_acl(bucket_name)
+
+        if not result.get("success"):
+            return DiagnosticResult(
+                check_name="ACL Permissions",
+                status=CheckStatus.ERROR,
+                severity=Severity.HIGH,
+                message=f"Could not retrieve ACL: {result.get('error')}",
+                details=result,
+            )
+
+        grants = result["grants"]
         issues = []
-        for g in r["grants"]:
-            uri = g.get("Grantee", {}).get("URI", "")
-            if "AllUsers" in uri:
-                issues.append("PUBLIC: " + g.get("Permission", ""))
-            elif "AuthenticatedUsers" in uri:
-                issues.append("AUTH_USERS: " + g.get("Permission", ""))
+
+        for grant in grants:
+            grantee = grant.get("Grantee", {})
+            permission = grant.get("Permission", "")
+            grantee_uri = grantee.get("URI", "")
+
+            # Check for public access via ACL
+            if "AllUsers" in grantee_uri:
+                issues.append(
+                    {
+                        "type": "PUBLIC_ACL",
+                        "grantee": "Everyone (AllUsers)",
+                        "permission": permission,
+                    }
+                )
+            elif "AuthenticatedUsers" in grantee_uri:
+                issues.append(
+                    {
+                        "type": "AUTHENTICATED_USERS_ACL",
+                        "grantee": "All AWS Authenticated Users",
+                        "permission": permission,
+                    }
+                )
+
         if issues:
-            return DiagnosticResult("ACL Permissions", CheckStatus.FAIL, Severity.CRITICAL, str(len(issues)) + " bad grant(s).", {"grants": r["grants"], "issues": issues}, "Remove public grants.")
-        return DiagnosticResult("ACL Permissions", CheckStatus.PASS, Severity.HIGH, "ACL OK.", {"grants": r["grants"]})
+            return DiagnosticResult(
+                check_name="ACL Permissions",
+                status=CheckStatus.FAIL,
+                severity=Severity.CRITICAL,
+                message=f"ACL has {len(issues)} overly permissive grant(s).",
+                details={"grants": grants, "issues": issues},
+                recommendation="Remove public ACL grants. Use bucket policies for access control instead.",
+            )
 
-    def check_encryption(self, bucket_name):
-        r = self.s3.get_bucket_encryption(bucket_name)
-        if r.get("enabled"):
-            algo = r["rules"][0].get("ApplyServerSideEncryptionByDefault", {}).get("SSEAlgorithm", "Unknown")
-            return DiagnosticResult("Server-Side Encryption", CheckStatus.PASS, Severity.HIGH, "Encryption enabled with " + algo + ".", r)
-        return DiagnosticResult("Server-Side Encryption", CheckStatus.FAIL, Severity.HIGH, "Encryption NOT enabled.", r, "Enable encryption.", True, "Enable AES-256.")
+        return DiagnosticResult(
+            check_name="ACL Permissions",
+            status=CheckStatus.PASS,
+            severity=Severity.HIGH,
+            message="ACL permissions look correct.",
+            details={"grants": grants},
+        )
 
-    def check_versioning(self, bucket_name):
-        r = self.s3.get_bucket_versioning(bucket_name)
-        s = r.get("status", "Disabled")
-        if s == "Enabled":
-            return DiagnosticResult("Versioning", CheckStatus.PASS, Severity.MEDIUM, "Versioning enabled.", r)
-        if s == "Suspended":
-            return DiagnosticResult("Versioning", CheckStatus.WARNING, Severity.MEDIUM, "Versioning SUSPENDED.", r, "Re-enable.", True, "Enable versioning.")
-        return DiagnosticResult("Versioning", CheckStatus.FAIL, Severity.MEDIUM, "Versioning NOT enabled.", r, "Enable versioning.", True, "Enable versioning.")
+    def check_encryption(self, bucket_name: str) -> DiagnosticResult:
+        """Check server-side encryption configuration."""
+        result = self.s3.get_bucket_encryption(bucket_name)
 
-    def check_lifecycle(self, bucket_name):
-        r = self.s3.get_lifecycle_rules(bucket_name)
-        if r.get("exists") and r.get("rules"):
-            en = [x for x in r["rules"] if x.get("Status") == "Enabled"]
-            return DiagnosticResult("Lifecycle Rules", CheckStatus.PASS, Severity.LOW, str(len(en)) + " active rule(s).", r)
-        return DiagnosticResult("Lifecycle Rules", CheckStatus.WARNING, Severity.LOW, "No lifecycle rules.", r, "Add lifecycle rules.")
+        if result.get("enabled"):
+            rules = result["rules"]
+            algo = (
+                rules[0]
+                .get("ApplyServerSideEncryptionByDefault", {})
+                .get("SSEAlgorithm", "Unknown")
+            )
+            return DiagnosticResult(
+                check_name="Server-Side Encryption",
+                status=CheckStatus.PASS,
+                severity=Severity.HIGH,
+                message=f"Encryption enabled with {algo}.",
+                details={"rules": rules, "algorithm": algo},
+            )
 
-    def check_cors(self, bucket_name):
-        r = self.s3.get_cors_configuration(bucket_name)
-        if not r.get("exists"):
-            return DiagnosticResult("CORS Configuration", CheckStatus.PASS, Severity.INFO, "No CORS.", r)
-        issues = [i for i, rule in enumerate(r["rules"]) if "*" in rule.get("AllowedOrigins", [])]
+        return DiagnosticResult(
+            check_name="Server-Side Encryption",
+            status=CheckStatus.FAIL,
+            severity=Severity.HIGH,
+            message="Server-side encryption is NOT enabled.",
+            details=result,
+            recommendation="Enable default encryption (AES-256 or aws:kms).",
+            auto_fixable=True,
+            fix_description="Enable AES-256 default encryption.",
+        )
+
+    def check_versioning(self, bucket_name: str) -> DiagnosticResult:
+        """Check versioning status."""
+        result = self.s3.get_bucket_versioning(bucket_name)
+        status = result.get("status", "Disabled")
+
+        if status == "Enabled":
+            return DiagnosticResult(
+                check_name="Versioning",
+                status=CheckStatus.PASS,
+                severity=Severity.MEDIUM,
+                message="Versioning is enabled.",
+                details=result,
+            )
+        elif status == "Suspended":
+            return DiagnosticResult(
+                check_name="Versioning",
+                status=CheckStatus.WARNING,
+                severity=Severity.MEDIUM,
+                message="Versioning is SUSPENDED. Previously versioned objects remain, but new versions won't be created.",
+                details=result,
+                recommendation="Re-enable versioning for data protection.",
+                auto_fixable=True,
+                fix_description="Enable bucket versioning.",
+            )
+        else:
+            return DiagnosticResult(
+                check_name="Versioning",
+                status=CheckStatus.FAIL,
+                severity=Severity.MEDIUM,
+                message="Versioning is NOT enabled.",
+                details=result,
+                recommendation="Enable versioning to protect against accidental deletes and overwrites.",
+                auto_fixable=True,
+                fix_description="Enable bucket versioning.",
+            )
+
+    def check_lifecycle(self, bucket_name: str) -> DiagnosticResult:
+        """Check lifecycle rules."""
+        result = self.s3.get_lifecycle_rules(bucket_name)
+
+        if result.get("exists") and result.get("rules"):
+            rules = result["rules"]
+            enabled_rules = [r for r in rules if r.get("Status") == "Enabled"]
+            return DiagnosticResult(
+                check_name="Lifecycle Rules",
+                status=CheckStatus.PASS,
+                severity=Severity.LOW,
+                message=f"{len(enabled_rules)} active lifecycle rule(s) configured.",
+                details={
+                    "total_rules": len(rules),
+                    "enabled_rules": len(enabled_rules),
+                },
+            )
+
+        return DiagnosticResult(
+            check_name="Lifecycle Rules",
+            status=CheckStatus.WARNING,
+            severity=Severity.LOW,
+            message="No lifecycle rules configured.",
+            details=result,
+            recommendation="Add lifecycle rules to manage storage costs "
+            "(e.g., transition to Glacier, expire old objects).",
+        )
+
+    def check_cors(self, bucket_name: str) -> DiagnosticResult:
+        """Check CORS configuration for security issues."""
+        result = self.s3.get_cors_configuration(bucket_name)
+
+        if not result.get("exists"):
+            return DiagnosticResult(
+                check_name="CORS Configuration",
+                status=CheckStatus.PASS,
+                severity=Severity.INFO,
+                message="No CORS configuration (fine if not serving web content).",
+                details=result,
+            )
+
+        rules = result["rules"]
+        issues = []
+
+        for i, rule in enumerate(rules):
+            origins = rule.get("AllowedOrigins", [])
+            methods = rule.get("AllowedMethods", [])
+
+            if "*" in origins:
+                issues.append(
+                    {
+                        "rule_index": i,
+                        "type": "WILDCARD_ORIGIN",
+                        "detail": "Allows requests from any origin (*)",
+                    }
+                )
+            if "DELETE" in methods or "PUT" in methods:
+                issues.append(
+                    {
+                        "rule_index": i,
+                        "type": "WRITE_METHODS",
+                        "detail": f"Allows write methods: {[m for m in methods if m in ('PUT', 'DELETE')]}",
+                    }
+                )
+
         if issues:
-            return DiagnosticResult("CORS Configuration", CheckStatus.WARNING, Severity.MEDIUM, "Wildcard origin.", r, "Restrict origins.")
-        return DiagnosticResult("CORS Configuration", CheckStatus.PASS, Severity.LOW, "CORS OK.", r)
+            return DiagnosticResult(
+                check_name="CORS Configuration",
+                status=CheckStatus.WARNING,
+                severity=Severity.MEDIUM,
+                message=f"CORS has {len(issues)} potential issue(s).",
+                details={"rules": rules, "issues": issues},
+                recommendation="Restrict CORS origins to specific domains. Avoid wildcard (*).",
+            )
 
-    def check_logging(self, bucket_name):
-        r = self.s3.get_bucket_logging(bucket_name)
-        if r.get("enabled"):
-            return DiagnosticResult("Access Logging", CheckStatus.PASS, Severity.MEDIUM, "Logging enabled.", r)
-        return DiagnosticResult("Access Logging", CheckStatus.WARNING, Severity.MEDIUM, "Logging NOT enabled.", r, "Enable logging.", True, "Enable logging.")
+        return DiagnosticResult(
+            check_name="CORS Configuration",
+            status=CheckStatus.PASS,
+            severity=Severity.LOW,
+            message="CORS configuration looks properly scoped.",
+            details={"rules": rules},
+        )
 
-    def check_replication(self, bucket_name):
-        r = self.s3.get_bucket_replication(bucket_name)
-        if r.get("enabled"):
-            return DiagnosticResult("Replication", CheckStatus.PASS, Severity.INFO, "Replication configured.", r)
-        return DiagnosticResult("Replication", CheckStatus.INFO, Severity.INFO, "No replication.", r)
+    def check_logging(self, bucket_name: str) -> DiagnosticResult:
+        """Check access logging."""
+        result = self.s3.get_bucket_logging(bucket_name)
 
-    def check_object_lock(self, bucket_name):
-        r = self.s3.get_object_lock_configuration(bucket_name)
-        if r.get("enabled"):
-            return DiagnosticResult("Object Lock", CheckStatus.PASS, Severity.INFO, "Object Lock enabled.", r)
-        return DiagnosticResult("Object Lock", CheckStatus.INFO, Severity.INFO, "No Object Lock.", r)
+        if result.get("enabled"):
+            return DiagnosticResult(
+                check_name="Access Logging",
+                status=CheckStatus.PASS,
+                severity=Severity.MEDIUM,
+                message="Access logging is enabled.",
+                details=result,
+            )
 
-    def check_transfer_acceleration(self, bucket_name):
-        r = self.s3.get_transfer_acceleration(bucket_name)
-        return DiagnosticResult("Transfer Acceleration", CheckStatus.INFO, Severity.INFO, "Accel: " + r.get("status", "Unknown"), r)
+        return DiagnosticResult(
+            check_name="Access Logging",
+            status=CheckStatus.WARNING,
+            severity=Severity.MEDIUM,
+            message="Access logging is NOT enabled.",
+            details=result,
+            recommendation="Enable server access logging for audit and security monitoring.",
+            auto_fixable=True,
+            fix_description="Enable access logging to a target bucket.",
+        )
 
-    def check_tagging(self, bucket_name):
-        r = self.s3.get_bucket_tagging(bucket_name)
-        if r.get("exists") and r.get("tags"):
-            return DiagnosticResult("Bucket Tagging", CheckStatus.PASS, Severity.LOW, str(len(r["tags"])) + " tag(s).", r)
-        return DiagnosticResult("Bucket Tagging", CheckStatus.WARNING, Severity.LOW, "No tags.", r, "Add tags.")
+    def check_replication(self, bucket_name: str) -> DiagnosticResult:
+        """Check replication configuration."""
+        result = self.s3.get_bucket_replication(bucket_name)
 
-    def check_bucket_size(self, bucket_name):
-        r = self.s3.get_bucket_size_estimate(bucket_name)
-        if r.get("success"):
-            return DiagnosticResult("Bucket Size", CheckStatus.INFO, Severity.INFO, str(r["object_count"]) + " objects, " + str(r["total_size_mb"]) + " MB.", r)
-        return DiagnosticResult("Bucket Size", CheckStatus.ERROR, Severity.INFO, "Cannot get size.", r)
+        if result.get("enabled"):
+            return DiagnosticResult(
+                check_name="Replication",
+                status=CheckStatus.PASS,
+                severity=Severity.INFO,
+                message="Cross-region/same-region replication is configured.",
+                details=result,
+            )
+
+        return DiagnosticResult(
+            check_name="Replication",
+            status=CheckStatus.INFO,
+            severity=Severity.INFO,
+            message="No replication configured (may be acceptable depending on requirements).",
+            details=result,
+            recommendation="Consider enabling replication for disaster recovery.",
+        )
+
+    def check_object_lock(self, bucket_name: str) -> DiagnosticResult:
+        """Check Object Lock configuration."""
+        result = self.s3.get_object_lock_configuration(bucket_name)
+
+        if result.get("enabled"):
+            return DiagnosticResult(
+                check_name="Object Lock",
+                status=CheckStatus.PASS,
+                severity=Severity.INFO,
+                message="Object Lock is enabled (WORM protection).",
+                details=result,
+            )
+
+        return DiagnosticResult(
+            check_name="Object Lock",
+            status=CheckStatus.INFO,
+            severity=Severity.INFO,
+            message="Object Lock is not enabled.",
+            details=result,
+            recommendation="Enable Object Lock if you need WORM (Write Once Read Many) compliance.",
+        )
+
+    def check_transfer_acceleration(self, bucket_name: str) -> DiagnosticResult:
+        """Check Transfer Acceleration status."""
+        result = self.s3.get_transfer_acceleration(bucket_name)
+
+        return DiagnosticResult(
+            check_name="Transfer Acceleration",
+            status=CheckStatus.INFO,
+            severity=Severity.INFO,
+            message=f"Transfer Acceleration: {result.get('status', 'Unknown')}",
+            details=result,
+        )
+
+    def check_tagging(self, bucket_name: str) -> DiagnosticResult:
+        """Check bucket tagging for governance."""
+        result = self.s3.get_bucket_tagging(bucket_name)
+
+        if result.get("exists") and result.get("tags"):
+            tags = result["tags"]
+            tag_keys = [t["Key"] for t in tags]
+
+            recommended_tags = ["Environment", "Project", "Owner", "CostCenter"]
+            missing = [t for t in recommended_tags if t not in tag_keys]
+
+            if missing:
+                return DiagnosticResult(
+                    check_name="Bucket Tagging",
+                    status=CheckStatus.WARNING,
+                    severity=Severity.LOW,
+                    message=f"Bucket has {len(tags)} tag(s) but missing recommended: {missing}",
+                    details={"tags": tags, "missing_recommended": missing},
+                    recommendation=f"Add these tags for governance: {missing}",
+                )
+
+            return DiagnosticResult(
+                check_name="Bucket Tagging",
+                status=CheckStatus.PASS,
+                severity=Severity.LOW,
+                message=f"Bucket has {len(tags)} tag(s) including recommended governance tags.",
+                details={"tags": tags},
+            )
+
+        return DiagnosticResult(
+            check_name="Bucket Tagging",
+            status=CheckStatus.WARNING,
+            severity=Severity.LOW,
+            message="No tags configured.",
+            details=result,
+            recommendation="Add tags (Environment, Project, Owner, CostCenter) for governance.",
+        )
+
+    def check_bucket_size(self, bucket_name: str) -> DiagnosticResult:
+        """Check bucket size and object count."""
+        result = self.s3.get_bucket_size_estimate(bucket_name)
+
+        if result.get("success"):
+            return DiagnosticResult(
+                check_name="Bucket Size",
+                status=CheckStatus.INFO,
+                severity=Severity.INFO,
+                message=f"Bucket contains ~{result['object_count']} objects, "
+                f"~{result['total_size_mb']} MB "
+                f"{'(sampled)' if result['sampled'] else '(complete)'}.",
+                details=result,
+            )
+
+        return DiagnosticResult(
+            check_name="Bucket Size",
+            status=CheckStatus.ERROR,
+            severity=Severity.INFO,
+            message=f"Could not determine bucket size: {result.get('error')}",
+            details=result,
+        )
