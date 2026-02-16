@@ -1,0 +1,36 @@
+# S3 Troubleshooter Configuration
+
+aws:
+  default_region: us-east-1
+  max_retries: 3
+  timeout: 30
+
+ai:
+  model: gpt-4
+  temperature: 0.2
+  max_tokens: 4000
+
+diagnostics:
+  checks:
+    - bucket_exists
+    - access_permissions
+    - bucket_policy
+    - public_access
+    - encryption
+    - versioning
+    - lifecycle_rules
+    - cors_configuration
+    - logging
+    - replication
+    - object_lock
+    - transfer_acceleration
+  severity_levels:
+    critical: 1
+    high: 2
+    medium: 3
+    low: 4
+    info: 5
+
+reporting:
+  output_dir: reports
+  format: both  # json, html, both
